@@ -266,6 +266,7 @@ def emit_blockcompletion_event(sender, instance, **kwargs):
 @receiver(post_save, sender=Submission)
 def emit_submission_event(sender, instance, created=None, **kwargs):
     message = _model_to_dict(instance, event_fields[sender])
+    uuid = message["student_item"]["student_id"]
     message.update(user_id=user_by_anonymous_id(uuid).id)  # type: ignore
     _emit_event(sender, message, created=created)
 
