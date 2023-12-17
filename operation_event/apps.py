@@ -10,10 +10,7 @@ class OperationEventConfig(AppConfig):
     Configuration for the operation_event Django application.
     """
 
-    name = 'operation_event'
-
-    def ready(self):
-        import operation_event.signals
+    name = "operation_event"
 
     plugin_app = {
         "signals_config": {
@@ -25,4 +22,3 @@ class OperationEventConfig(AppConfig):
             },
         },
     }
-
