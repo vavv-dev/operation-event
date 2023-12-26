@@ -5,7 +5,7 @@ import sys
 from common.djangoapps.student.models import CourseAccessRole, user_by_anonymous_id
 from common.djangoapps.student.models import CourseEnrollment, UserProfile
 from completion.models import BlockCompletion
-from crum import get_current_request
+from crum import get_current_request, get_current_user
 from crum import get_current_request
 from django.contrib.auth.models import User
 from django.contrib.sites.models import Site
@@ -15,11 +15,6 @@ from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 from django.utils.timezone import localtime
 from edx_proctoring.models import ProctoredExamStudentAttempt
-from enterprise.models import (
-    EnterpriseCourseEnrollment,
-    EnterpriseCustomer,
-    EnterpriseCustomerUser,
-)
 from ipware import get_client_ip
 from lms.djangoapps.course_api.blocks.api import get_blocks
 from lms.djangoapps.grades.signals.signals import SUBSECTION_SCORE_CHANGED
@@ -35,7 +30,7 @@ from openedx.core.djangoapps.django_comment_common.signals import (
     thread_voted,
 )
 from openedx.core.djangoapps.signals.signals import COURSE_GRADE_CHANGED
-from submissions.models import Submission, Score
+from submissions.models import Score, Submission
 from xmodule.modulestore.django import modulestore
 
 
@@ -67,7 +62,13 @@ event_fields = {
         "certificate_available_date",
         "pacing",
     ],
-    CourseAccessRole: ["id", "user_id", "course_id", "org", "role"],
+    CourseAccessRole: [
+        "id",
+        "user_id",
+        "course_id",
+        "org",
+        "role",
+    ],
     User: [
         "id",
         "username",
@@ -78,9 +79,26 @@ event_fields = {
         "last_login",
         "date_joined",
     ],
-    UserProfile: ["id", "user_id", "name", "year_of_birth"],
-    CourseEnrollment: ["created", "id", "user_id", "course_id", "mode", "is_active"],
-    BlockCompletion: ["user_id", "context_key", "block_key"],
+    UserProfile: [
+        "id",
+        "user_id",
+        "name",
+        "year_of_birth",
+        "gender",
+    ],
+    CourseEnrollment: [
+        "created",
+        "id",
+        "user_id",
+        "course_id",
+        "mode",
+        "is_active",
+    ],
+    BlockCompletion: [
+        "user_id",
+        "context_key",
+        "block_key",
+    ],
     ProctoredExamStudentAttempt: [
         "created",
         "modified",
@@ -97,8 +115,10 @@ event_fields = {
         "student_item__student_id",
         "student_item__course_id",
         "student_item__item_id",
+        "attempt_number",
         "submitted_at",
         "created_at",
+        "answer",
         "status",
     ],
     Score: [
@@ -109,26 +129,6 @@ event_fields = {
         "created_at",
         "reset",
     ],
-    EnterpriseCustomer: ["created", "modified", "uuid", "name", "slug", "active", "site_id"],
-    EnterpriseCustomerUser: [
-        "created",
-        "modified",
-        "id",
-        "enterprise_customer_id",
-        "user_id",
-        "active",
-        "linked",
-    ],
-    EnterpriseCourseEnrollment: [
-        "created",
-        "modified",
-        "enterprise_customer_user_id",
-        "course_id",
-        "saved_for_later",
-        "unenrolled",
-        "unenrolled_at",
-    ],
-    Site: ["id", "name", "domain"],
 }
 
 
@@ -141,11 +141,16 @@ event_fields = {
 @receiver(post_save, sender=ProctoredExamStudentAttempt)
 @receiver(post_delete, sender=ProctoredExamStudentAttempt)
 @receiver(post_save, sender=Score)
-@receiver(post_save, sender=EnterpriseCustomer)
-@receiver(post_save, sender=EnterpriseCustomerUser)
-@receiver(post_save, sender=EnterpriseCourseEnrollment)
 @receiver(post_save, sender=Site)
 def emit_model_event(sender, instance, created=None, signal=None, **kwargs):
+    """emit_model_event.
+
+    :param sender:
+    :param instance:
+    :param created:
+    :param signal:
+    :param kwargs:
+    """
     message = _model_to_dict(instance, event_fields[sender])
     _emit_event(sender, message, created=created, deleted=signal is post_delete)
 
@@ -164,7 +169,19 @@ Forum Thread, Comment
 @receiver(thread_voted)
 @receiver(thread_deleted)
 def emit_forumpost_event(sender, post, signal=None, **kwargs):
+    """emit_forumpost_event.
+
+    :param sender:
+    :param post:
+    :param signal:
+    :param kwargs:
+    """
     message = post.to_dict()
+
+    user = get_current_user()
+    if user and user.is_authenticated:
+        message["username"] = user.username
+
     _emit_event(
         "ForumPost",
         message,
@@ -180,12 +197,19 @@ Grade and Completion
 
 @receiver(COURSE_GRADE_CHANGED)
 def emit_coursegrade_event(sender, user, course_grade, course_key, **kwargs):
+    """emit_coursegrade_event.
+
+    :param sender:
+    :param user:
+    :param course_grade:
+    :param course_key:
+    :param kwargs:
+    """
     grade_summary = {}
 
     if course_grade.attempted:
         course_data = course_grade.course_data
         course = course_data.course
-        graded_squentials = course_grade.graded_subsections_by_format(False)
         grade_summary = {
             grader.get("type"): {
                 "min_count": grader.get("min_count"),
@@ -194,15 +218,27 @@ def emit_coursegrade_event(sender, user, course_grade, course_key, **kwargs):
             for grader in course.raw_grader
         }
 
+        # https://github.com/openedx/edx-platform/pull/30043/commits
+        # a162140492d256be7cde5a53cb24ba221bc5cf5b
+        #
+        # graded_squentials = course_grade.graded_subsections_by_format(False)
+        # for subgrader, _format, weight in course.grader.subgraders:
+        #     subgrade_result = subgrader.grade(graded_squentials)
+        #     grade_summary[_format].update(
+        #         percent=subgrade_result.get("percent"),
+        #         weighted_percent=weight * subgrade_result.get("percent"),
+        #      )
+
+        subsections_by_format = course_grade.graded_subsections_by_format
         for subgrader, _format, weight in course.grader.subgraders:
-            subgrade_result = subgrader.grade(graded_squentials)
+            subgrade_result = subgrader.grade(subsections_by_format)
             grade_summary[_format].update(
                 percent=subgrade_result.get("percent"),
                 weighted_percent=weight * subgrade_result.get("percent"),
             )
 
     message = {
-        "user_id": user.id,
+        "username": user.username,
         "course_id": str(course_key),
         "percent_grade": course_grade.percent,
         "letter_grade": course_grade.letter_grade,
@@ -214,8 +250,17 @@ def emit_coursegrade_event(sender, user, course_grade, course_key, **kwargs):
 
 @receiver(SUBSECTION_SCORE_CHANGED)
 def emit_subsectiongrade_event(sender, course, course_structure, user, subsection_grade, **kwargs):
+    """emit_subsectiongrade_event.
+
+    :param sender:
+    :param course:
+    :param course_structure:
+    :param user:
+    :param subsection_grade:
+    :param kwargs:
+    """
     message = {
-        "user_id": user.id,
+        "username": user.username,
         "course_id": str(course.id),
         "usage_key": str(subsection_grade.location),
         "earned_all": subsection_grade.all_total.earned,
@@ -229,11 +274,21 @@ def emit_subsectiongrade_event(sender, course, course_structure, user, subsectio
 
 @receiver(post_save, sender=BlockCompletion)
 def emit_blockcompletion_event(sender, instance, **kwargs):
+    """emit_blockcompletion_event.
+
+    :param sender:
+    :param instance:
+    :param kwargs:
+    """
     if instance.completion < 1.0:
         return
 
     # get subsection
     def get_subsection_location(location):
+        """get_subsection_location.
+
+        :param location:
+        """
         parent_location = modulestore().get_parent_location(location)
         if parent_location.block_type == "sequential":  # type: ignore
             return parent_location
@@ -265,13 +320,27 @@ def emit_blockcompletion_event(sender, instance, **kwargs):
 
 @receiver(post_save, sender=Submission)
 def emit_submission_event(sender, instance, created=None, **kwargs):
+    """emit_submission_event.
+
+    :param sender:
+    :param instance:
+    :param created:
+    :param kwargs:
+    """
     message = _model_to_dict(instance, event_fields[sender])
     uuid = message["student_item"]["student_id"]
-    message.update(user_id=user_by_anonymous_id(uuid).id)  # type: ignore
+    message.update(username=user_by_anonymous_id(uuid).username)
     _emit_event(sender, message, created=created)
 
 
 def _emit_event(sender, message, created=None, deleted=None):
+    """_emit_event.
+
+    :param sender:
+    :param message:
+    :param created:
+    :param deleted:
+    """
     # event type
     sender = sender if isinstance(sender, str) else sender.__name__
     event = {
@@ -284,10 +353,14 @@ def _emit_event(sender, message, created=None, deleted=None):
 
     request = get_current_request()
     event["client_ip"], _ = get_client_ip(request) if request else (None, None)
-    event["request_user_id"] = request.user.id if request and request.user else None
+    event["request_username"] = request.user.username if request and request.user else None
     event["user_agent"] = request.META.get("HTTP_USER_AGENT", None) if request else None
 
     def emit(e):
+        """emit.
+
+        :param e:
+        """
         e = json.dumps(e)
         logger.info(e)
 
@@ -298,6 +371,12 @@ def _emit_event(sender, message, created=None, deleted=None):
 
 
 def _model_to_dict(instance, field_names=None, related_model_cache=None):
+    """_model_to_dict.
+
+    :param instance:
+    :param field_names:
+    :param related_model_cache:
+    """
     if field_names is None:
         field_names = [f.name for f in instance._meta.get_fields()]
 
@@ -319,6 +398,12 @@ def _model_to_dict(instance, field_names=None, related_model_cache=None):
         if len(parts) == 1:
             if isinstance(value, Manager):
                 continue
+
+            # attach username
+            if key == "user_id":
+                if hasattr(instance, "user"):
+                    result["username"] = instance.user.username
+                    continue
 
             if isinstance(value, models.Model) and value:
                 key = f"{key}_id"
